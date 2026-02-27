@@ -6,25 +6,63 @@
  */
 
 import { Certificate } from '@/lib/types';
-import { 
-  Table, 
-  TableBody, 
-  TableCell, 
-  TableHead, 
-  TableHeader, 
-  TableRow 
+import { generateCertificatePdf } from '@/lib/generateCertificatePdf';
+import { useToast } from '@/hooks/use-toast';
+import { useState } from 'react';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ExternalLink, FileText, Download, User, Calendar, Search } from 'lucide-react';
 import { Input } from '@/components/ui/input';
-import { useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import Link from 'next/link';
 
 export default function CertificateList({ certificates }: { certificates: Certificate[] }) {
   const [searchTerm, setSearchTerm] = useState('');
+  const [isGenerating, setIsGenerating] = useState<string | null>(null);
+  const { toast } = useToast();
 
-  const filtered = certificates.filter(c => 
+  const handleDownload = async (cert: Certificate) => {
+    if (cert.pdfUrl) {
+      window.open(cert.pdfUrl, '_blank');
+      return;
+    }
+
+    try {
+      setIsGenerating(cert.id);
+      const { pdfBlob } = await generateCertificatePdf({
+        certificateId: cert.id,
+        studentName: cert.studentName,
+        courseName: cert.courseName,
+        issueDate: cert.issueDate,
+        universityName: cert.universityName || 'University',
+      });
+
+      const url = URL.createObjectURL(pdfBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `verified-certificate-${cert.studentName.replace(/\s+/g, '-')}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error("PDF Generation Error:", err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      toast({ title: 'Download Failed', description: `Could not generate certificate PDF: ${errMsg}`, variant: 'destructive' });
+    } finally {
+      setIsGenerating(null);
+    }
+  };
+
+  const filtered = certificates.filter(c =>
     c.studentName.toLowerCase().includes(searchTerm.toLowerCase()) ||
     c.courseName.toLowerCase().includes(searchTerm.toLowerCase()) ||
     c.id.toLowerCase().includes(searchTerm.toLowerCase())
@@ -34,8 +72,8 @@ export default function CertificateList({ certificates }: { certificates: Certif
     <div className="space-y-4 animate-in fade-in duration-500">
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-        <Input 
-          placeholder="Search by student name, course, or ID..." 
+        <Input
+          placeholder="Search by student name, course, or ID..."
           className="pl-10"
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
@@ -95,15 +133,23 @@ export default function CertificateList({ certificates }: { certificates: Certif
                           <ExternalLink className="h-4 w-4" />
                         </Link>
                       </Button>
-                      
-                      {cert.pdfUrl && (
-                        <Button asChild variant="secondary" size="sm" className="h-8 gap-2" title="Download Secured PDF">
-                          <a href={cert.pdfUrl} target="_blank" rel="noopener noreferrer">
-                            <Download className="h-3 w-3" />
-                            <span className="hidden sm:inline">Download</span>
-                          </a>
-                        </Button>
-                      )}
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className="h-8 gap-2"
+                        title="Download Secured PDF"
+                        onClick={() => handleDownload(cert)}
+                        disabled={isGenerating === cert.id}
+                      >
+                        {isGenerating === cert.id ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Download className="h-3 w-3" />
+                        )}
+                        <span className="hidden sm:inline">
+                          {isGenerating === cert.id ? 'Wait...' : 'Download'}
+                        </span>
+                      </Button>
                     </div>
                   </TableCell>
                 </TableRow>
