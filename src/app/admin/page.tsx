@@ -7,7 +7,8 @@ import { collection, query, where, onSnapshot, doc, updateDoc } from 'firebase/f
 import { University, Certificate } from '@/lib/types';
 import CertificateForm from '@/components/admin/CertificateForm';
 import CertificateList from '@/components/admin/CertificateList';
-import { Loader2, AlertCircle, ShieldCheck, Building2, History, PlusCircle, Wallet } from 'lucide-react';
+import { Loader2, AlertCircle, ShieldCheck, Building2, History, PlusCircle, Wallet, Crown } from 'lucide-react';
+import Link from 'next/link';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -21,7 +22,7 @@ export default function AdminDashboard() {
   const { user, isUserLoading } = useUser();
   const { account, isConnected, isCorrectNetwork, connect, getSignerContract, getReadContract, switchToSepolia } = useMetaMask();
   const { toast } = useToast();
-  
+
   const [university, setUniversity] = useState<University | null>(null);
   const [issuedCertificates, setIssuedCertificates] = useState<Certificate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -36,15 +37,15 @@ export default function AdminDashboard() {
     }
 
     const qUni = query(
-      collection(db, 'universities'), 
+      collection(db, 'universities'),
       where('emailDomain', '==', user.email?.toLowerCase().trim())
     );
-    
+
     const unsubscribeUni = onSnapshot(qUni, (snapshot) => {
       if (!snapshot.empty) {
         const uniDoc = snapshot.docs[0];
-        const uniData = uniDoc.data() as University;
-        setUniversity({ id: uniDoc.id, ...uniData });
+        const uniData = uniDoc.data() as Omit<University, 'id'>;
+        setUniversity({ ...uniData, id: uniDoc.id });
         if (!uniData.adminUid) {
           updateDoc(doc(db, 'universities', uniDoc.id), { adminUid: user.uid }).catch(console.error);
         }
@@ -94,16 +95,16 @@ export default function AdminDashboard() {
   const handleBlockchainRegister = async () => {
     if (!isConnected) { connect(); return; }
     if (!isCorrectNetwork) { switchToSepolia(); return; }
-    
+
     setIsRegistering(true);
     try {
       const contract = await getSignerContract();
       const domain = university?.emailDomain.split('@').pop() || 'edu.in';
-      
+
       toast({ title: 'Registration Started', description: 'Signing on-chain profile registration...' });
       const tx = await contract.registerUniversity(university?.name || '', domain, 0);
       await tx.wait();
-      
+
       setChainStatus(0);
       toast({ title: 'Profile Registered!', description: 'Now wait for the Super Admin to authorize your wallet.' });
     } catch (err: any) {
@@ -137,6 +138,15 @@ export default function AdminDashboard() {
 
   return (
     <div className="container mx-auto px-4 py-8 space-y-8 animate-in fade-in duration-700">
+      {/* Super Admin shortcut */}
+      <div className="max-w-4xl mx-auto flex justify-end">
+        <Button asChild variant="outline" size="sm" className="gap-2">
+          <Link href="/admin/super">
+            <Crown className="h-4 w-4 text-yellow-500" />
+            Super Admin Panel
+          </Link>
+        </Button>
+      </div>
       <div className="max-w-4xl mx-auto rounded-xl border border-primary/20 bg-card p-6 flex flex-col sm:flex-row items-center gap-6">
         <div className="h-16 w-16 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
           <Building2 className="h-8 w-8 text-primary" />
@@ -168,7 +178,7 @@ export default function AdminDashboard() {
               <div className="flex-1 text-center sm:text-left">
                 <p className="font-semibold">Blockchain Profile Setup</p>
                 <p className="text-sm text-muted-foreground">
-                  {chainStatus === -1 
+                  {chainStatus === -1
                     ? "You must register your profile on the blockchain before you can issue certificates."
                     : "Profile registered! Waiting for Super Admin authorization."}
                 </p>

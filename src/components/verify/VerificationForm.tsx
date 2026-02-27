@@ -1,37 +1,39 @@
 'use client';
 
 /**
- * VerificationForm.tsx
- * 
- * Implements visual QR detection for uploaded PDFs and Images,
- * Camera scanning, and Manual ID Entry.
+ * VerificationForm.tsx — CertChain V2
+ *
+ * Three verification modes:
+ *  1. Upload PDF/Image   — renders PDF → canvas → jsqr scan
+ *  2. Camera QR Scan     — live camera via @zxing/browser
+ *  3. Manual Entry       — type/paste Certificate ID directly
+ *
+ * QR scanning uses jsqr (reliable pixel-level scanner) instead of
+ * BrowserQRCodeReader.decodeFromImageElement (often fails on canvas).
  */
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useMetaMask } from '@/hooks/useMetaMask';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { Separator } from '@/components/ui/separator';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Badge } from '@/components/ui/badge';
+import { Separator } from '@/components/ui/separator';
+import {
+  Card, CardContent, CardHeader, CardTitle, CardDescription,
+} from '@/components/ui/card';
 import { useToast } from '@/hooks/use-toast';
 import {
-  CheckCircle2, XCircle, Loader2, Camera, StopCircle, RotateCcw, ExternalLink, ShieldCheck, Upload, AlertTriangle, Search, Keyboard
+  CheckCircle2, XCircle, Loader2, Camera, StopCircle, RotateCcw,
+  ExternalLink, ShieldCheck, Upload, AlertTriangle, FileText,
 } from 'lucide-react';
 import { BrowserQRCodeReader } from '@zxing/browser';
 import { db } from '@/lib/firebase';
 import { doc, getDoc } from 'firebase/firestore';
-import * as pdfjs from 'pdfjs-dist';
 
-// Initialize PDF.js worker
-if (typeof window !== 'undefined') {
-  pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
-}
-
-// ── Types ───────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────
 type Mode = 'choose' | 'scan' | 'upload' | 'manual';
-type Status = 'idle' | 'loading' | 'valid' | 'invalid' | 'error';
+type Status = 'idle' | 'scanning_pdf' | 'loading' | 'valid' | 'invalid' | 'error';
 
 type CertResult = {
   studentName: string;
@@ -45,46 +47,117 @@ type CertResult = {
   transactionHash: string;
 };
 
-// ── QR Scanner Component ────────────────────────────────────────────────
-function QrScanner({ onScan }: { onScan: (result: string) => void }) {
+// ── Extract cert ID from QR text ──────────────────────────────────────────
+function extractCertId(text: string): string {
+  // Try to match a UUID from a verify URL: /verify/<uuid>
+  const uuidMatch = text.match(/\/verify\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  if (uuidMatch) return uuidMatch[1];
+  // Try to match a bare UUID
+  const bareUuid = text.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+  if (bareUuid) return bareUuid[1];
+  return text.trim();
+}
+
+// ── Scan QR from canvas using jsqr (reliable pixel-level scanner) ─────────
+async function scanQrFromCanvas(canvas: HTMLCanvasElement): Promise<string | null> {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  // Try multiple crops of the canvas to find the QR (it's usually in the bottom-right)
+  const { width, height } = canvas;
+
+  const regions = [
+    // Full image
+    { sx: 0, sy: 0, sw: width, sh: height },
+    // Bottom-right quadrant (where QR usually is in our cert template)
+    { sx: Math.floor(width * 0.55), sy: Math.floor(height * 0.65), sw: Math.floor(width * 0.45), sh: Math.floor(height * 0.35) },
+    // Bottom half
+    { sx: 0, sy: Math.floor(height * 0.5), sw: width, sh: Math.floor(height * 0.5) },
+    // Right half
+    { sx: Math.floor(width * 0.5), sy: 0, sw: Math.floor(width * 0.5), sh: height },
+  ];
+
+  // Dynamic import so it doesn't break SSR
+  const jsqr = (await import('jsqr')).default;
+
+  for (const { sx, sy, sw, sh } of regions) {
+    if (sw <= 0 || sh <= 0) continue;
+    const imageData = ctx.getImageData(sx, sy, sw, sh);
+    const code = jsqr(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts: 'attemptBoth',
+    });
+    if (code?.data) {
+      return extractCertId(code.data);
+    }
+  }
+  return null;
+}
+
+// ── Render PDF page to canvas ─────────────────────────────────────────────
+async function renderPdfToCanvas(file: File, scale = 3.0): Promise<HTMLCanvasElement | null> {
+  try {
+    // Dynamically import pdfjs-dist to avoid SSR issues
+    const pdfjs = await import('pdfjs-dist');
+    if (typeof window !== 'undefined') {
+      pdfjs.GlobalWorkerOptions.workerSrc =
+        `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+    }
+
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+    const page = await pdf.getPage(1);
+    const viewport = page.getViewport({ scale });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    if (!ctx) return null;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    return canvas;
+  } catch (err) {
+    console.error('PDF render error:', err);
+    return null;
+  }
+}
+
+// ── Camera QR Scanner ─────────────────────────────────────────────────────
+function CameraScanner({ onScan }: { onScan: (id: string) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const readerRef = useRef<BrowserQRCodeReader | null>(null);
   const controlsRef = useRef<{ stop: () => void } | null>(null);
   const [scanning, setScanning] = useState(false);
-  const [error, setScanError] = useState('');
+  const [camError, setCamError] = useState('');
 
-  const startScan = useCallback(async () => {
-    setScanError('');
+  const start = useCallback(async () => {
+    setCamError('');
     setScanning(true);
     try {
       const reader = new BrowserQRCodeReader();
-      readerRef.current = reader;
       const devices = await BrowserQRCodeReader.listVideoInputDevices();
-      if (!devices.length) throw new Error('No camera found on this device.');
-
+      if (!devices.length) throw new Error('No camera found.');
       const deviceId = devices[devices.length - 1].deviceId;
+
       const controls = await reader.decodeFromVideoDevice(
-        deviceId,
-        videoRef.current!,
+        deviceId, videoRef.current!,
         (result) => {
           if (result) {
-            const text = result.getText();
-            const match = text.match(/\/verify\/([a-f0-9-]{36})/i);
-            const certId = match ? match[1] : text.trim();
             controlsRef.current?.stop();
             setScanning(false);
-            onScan(certId);
+            onScan(extractCertId(result.getText()));
           }
         }
       );
       controlsRef.current = controls;
-    } catch (err: any) {
-      setScanError(err?.message || 'Camera access denied or error occurred.');
+    } catch (err: unknown) {
+      setCamError(err instanceof Error ? err.message : 'Camera error');
       setScanning(false);
     }
   }, [onScan]);
 
-  const stopScan = useCallback(() => {
+  const stop = useCallback(() => {
     controlsRef.current?.stop();
     setScanning(false);
   }, []);
@@ -101,82 +174,84 @@ function QrScanner({ onScan }: { onScan: (result: string) => void }) {
             <p className="text-sm text-muted-foreground">Camera preview</p>
           </div>
         )}
-      </div>
-
-      {error && <p className="text-sm text-destructive text-center">{error}</p>}
-
-      <div className="flex justify-center gap-3">
-        {!scanning ? (
-          <Button onClick={startScan} className="gap-2">
-            <Camera className="h-4 w-4" /> Start Camera
-          </Button>
-        ) : (
-          <Button onClick={stopScan} variant="destructive" className="gap-2">
-            <StopCircle className="h-4 w-4" /> Stop Scanning
-          </Button>
+        {scanning && (
+          <div className="absolute inset-8 border-2 border-primary/80 rounded pointer-events-none">
+            <div className="absolute top-0 left-0 w-5 h-5 border-t-2 border-l-2 border-primary" />
+            <div className="absolute top-0 right-0 w-5 h-5 border-t-2 border-r-2 border-primary" />
+            <div className="absolute bottom-0 left-0 w-5 h-5 border-b-2 border-l-2 border-primary" />
+            <div className="absolute bottom-0 right-0 w-5 h-5 border-b-2 border-r-2 border-primary" />
+          </div>
         )}
+      </div>
+      {camError && <p className="text-sm text-destructive text-center">{camError}</p>}
+      <div className="flex justify-center">
+        {!scanning
+          ? <Button onClick={start} className="gap-2"><Camera className="h-4 w-4" /> Start Camera</Button>
+          : <Button onClick={stop} variant="destructive" className="gap-2"><StopCircle className="h-4 w-4" /> Stop</Button>
+        }
       </div>
     </div>
   );
 }
 
-// ── Result View ──────────────────────────────────────────────────────────
+// ── Result Card ───────────────────────────────────────────────────────────
 function ResultCard({ status, result, certId }: {
   status: 'valid' | 'invalid';
   result?: CertResult;
   certId: string;
 }) {
-  const isValid = status === 'valid';
-
+  const ok = status === 'valid';
   return (
-    <Card className={isValid ? 'border-green-500/40 bg-green-500/5 animate-in zoom-in-95 duration-300' : 'border-red-500/40 bg-red-500/5 max-w-lg mx-auto animate-in zoom-in-95 duration-300'}>
+    <Card className={ok ? 'border-green-500/40 bg-green-500/5' : 'border-red-500/40 bg-red-500/5'}>
       <CardHeader>
-        <CardTitle className="flex items-center gap-4">
-          {isValid
-            ? <CheckCircle2 className="h-10 w-10 text-green-500 shrink-0" />
-            : <XCircle className="h-10 w-10 text-red-500 shrink-0" />
-          }
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xl font-bold">Verification Result</span>
-            <Badge className={isValid ? 'bg-green-600 hover:bg-green-600 px-3' : 'bg-red-600 hover:bg-red-600 px-3'}>
-              {isValid ? '✓ Certificate Valid' : '✗ Unverified Document'}
+        <CardTitle className="flex items-center gap-3">
+          {ok ? <CheckCircle2 className="h-9 w-9 text-green-500 shrink-0" />
+            : <XCircle className="h-9 w-9 text-red-500 shrink-0" />}
+          <div className="flex flex-col gap-1">
+            <span className="text-lg">Verification Result</span>
+            <Badge className={ok ? 'bg-green-600 w-fit' : 'bg-red-600 w-fit'}>
+              {ok ? '✓ Certificate Valid' : '✗ Not Found on Blockchain'}
             </Badge>
           </div>
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-6">
-        {isValid && result ? (
-          <div className="grid grid-cols-2 gap-y-4 text-sm">
-            {[
-              { label: 'Student Name', value: result.studentName },
-              { label: 'Course', value: result.courseName },
-              { label: 'Issue Date', value: result.issueDate },
-              { label: 'Issued By', value: result.universityName },
-              { label: 'Certificate ID', value: certId },
-            ].map(({ label, value }) => (
-              <div key={label} className="flex flex-col gap-1">
-                <p className="text-muted-foreground text-[10px] uppercase tracking-wider font-semibold">{label}</p>
-                <p className="font-medium break-all">{value}</p>
-              </div>
-            ))}
+      <CardContent className="space-y-4">
+        {ok && result ? (
+          <>
+            <div className="grid grid-cols-2 gap-y-3 text-sm">
+              {[
+                { label: 'Student Name', value: result.studentName },
+                { label: 'Course', value: result.courseName },
+                { label: 'Issue Date', value: result.issueDate },
+                { label: 'University', value: result.universityName || result.issuingUniversity.slice(0, 14) + '…' },
+                { label: 'Cert ID', value: certId.slice(0, 18) + '…' },
+              ].map(({ label, value }) => (
+                <div key={label}>
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+                  <p className="font-medium break-all text-sm">{value}</p>
+                </div>
+              ))}
+            </div>
+
             {result.transactionHash && (
-              <div className="col-span-2 mt-2">
-                <Separator className="mb-4 opacity-50" />
-                <Button asChild variant="outline" size="sm" className="w-full gap-2 border-primary/30 hover:bg-primary/5">
-                  <a href={`https://sepolia.etherscan.io/tx/${result.transactionHash}`} target="_blank">
-                    <ExternalLink className="h-4 w-4" /> View On-Chain Proof
+              <>
+                <Separator />
+                <Button asChild variant="outline" size="sm" className="w-full gap-2">
+                  <a href={`https://sepolia.etherscan.io/tx/${result.transactionHash}`} target="_blank" rel="noopener noreferrer">
+                    <ExternalLink className="h-4 w-4" /> View On Etherscan
                   </a>
                 </Button>
-              </div>
+              </>
             )}
-          </div>
+          </>
         ) : (
-          <div className="flex items-start gap-3 text-sm text-red-500/70 bg-red-500/5 p-4 rounded-lg border border-red-500/10">
-            <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5" />
-            <p className="leading-relaxed">
-              This Certificate ID ({certId}) does not match any official blockchain records. It may have been tampered with or was not issued through this platform.
-            </p>
-          </div>
+          <p className="text-sm text-muted-foreground flex items-start gap-2">
+            <AlertTriangle className="h-4 w-4 text-red-500 mt-0.5 shrink-0" />
+            <span>
+              No matching certificate found on the blockchain for ID: <code className="text-xs bg-muted px-1 rounded">{certId.slice(0, 20)}…</code>
+              <br />It may be fake, tampered, or not yet recorded.
+            </span>
+          </p>
         )}
       </CardContent>
     </Card>
@@ -187,6 +262,7 @@ function ResultCard({ status, result, certId }: {
 export default function VerificationForm() {
   const { getReadContract } = useMetaMask();
   const { toast } = useToast();
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [mode, setMode] = useState<Mode>('choose');
   const [status, setStatus] = useState<Status>('idle');
@@ -194,101 +270,173 @@ export default function VerificationForm() {
   const [certId, setCertId] = useState('');
   const [manualId, setManualId] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [pdfMsg, setPdfMsg] = useState('');
 
-  const decodeQrFromCanvas = async (canvas: HTMLCanvasElement): Promise<string | null> => {
-    const reader = new BrowserQRCodeReader();
+  // ── Core verify logic ─────────────────────────────────────────────────
+  const verify = useCallback(async (id: string) => {
+    const trimmedId = id.trim();
+    if (!trimmedId) { setErrorMsg('Please enter a Certificate ID.'); return; }
+
+    setCertId(trimmedId);
+    setStatus('loading');
+    setErrorMsg('');
+    setResult(undefined);
+
     try {
-      const dataUrl = canvas.toDataURL('image/png', 1.0);
-      const img = new Image();
-      img.src = dataUrl;
-      await new Promise((resolve) => img.onload = resolve);
-      
-      const result = await reader.decodeFromImageElement(img);
-      if (result) {
-        const text = result.getText();
-        const match = text.match(/\/verify\/([a-f0-9-]{36})/i);
-        return match ? match[1] : text.trim();
-      }
-    } catch (e) {
-      console.warn('QR decode failed:', e);
-    }
-    return null;
-  };
+      // Step 1: Check Firestore
+      const snap = await getDoc(doc(db, 'certificates', trimmedId));
+      if (!snap.exists()) { setStatus('invalid'); return; }
 
+      const stored = snap.data();
+
+      // Step 2: Verify on blockchain
+      const contract = getReadContract();
+      if (contract && stored.certificateHash) {
+        const hashBytes32 = stored.certificateHash.startsWith('0x')
+          ? stored.certificateHash
+          : `0x${stored.certificateHash}`;
+        try {
+          const onChain = await contract.verifyCertificate(hashBytes32);
+          const isRevoked = onChain[6] as boolean;
+          const isValid = onChain[7] as boolean;
+
+          if (!isValid || isRevoked) {
+            setStatus('invalid');
+            setResult({
+              studentName: stored.studentName ?? '',
+              courseName: stored.courseName ?? '',
+              issueDate: stored.issueDate ?? '',
+              issuingUniversity: String(onChain[3] ?? ''),
+              universityName: String(onChain[4] ?? stored.universityName ?? ''),
+              universityDomain: String(onChain[5] ?? ''),
+              isRevoked,
+              certificateId: trimmedId,
+              transactionHash: stored.transactionHash ?? '',
+            });
+            return;
+          }
+
+          setStatus('valid');
+          setResult({
+            studentName: String(onChain[0]) || stored.studentName,
+            courseName: String(onChain[1]) || stored.courseName,
+            issueDate: stored.issueDate,
+            issuingUniversity: String(onChain[3]),
+            universityName: String(onChain[4]) || stored.universityName || '',
+            universityDomain: String(onChain[5]) || '',
+            isRevoked: false,
+            certificateId: trimmedId,
+            transactionHash: stored.transactionHash ?? '',
+          });
+          return;
+        } catch {
+          // Contract call failed → cert not found on-chain
+          setStatus('invalid');
+          return;
+        }
+      }
+
+      // Firestore-only fallback (no RPC)
+      setStatus('valid');
+      setResult({
+        studentName: stored.studentName ?? '',
+        courseName: stored.courseName ?? '',
+        issueDate: stored.issueDate ?? '',
+        issuingUniversity: stored.universityWallet ?? '',
+        universityName: stored.universityName ?? '',
+        universityDomain: '',
+        isRevoked: false,
+        certificateId: trimmedId,
+        transactionHash: stored.transactionHash ?? '',
+      });
+    } catch (err: unknown) {
+      setStatus('error');
+      const msg = err instanceof Error ? err.message : 'Verification failed';
+      setErrorMsg(msg);
+      toast({ title: 'Error', description: msg, variant: 'destructive' });
+    }
+  }, [getReadContract, toast]);
+
+  // ── PDF / Image upload handler ────────────────────────────────────────
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    setStatus('loading');
-    setErrorMsg('');
+    // Reset file input so same file can be re-selected
+    if (fileInputRef.current) fileInputRef.current.value = '';
+
     setMode('upload');
+    setStatus('scanning_pdf');
+    setErrorMsg('');
+    setResult(undefined);
+    setPdfMsg(`Processing: ${file.name}`);
 
     try {
-      let extractedId: string | null = null;
-      const reader = new FileReader();
+      let canvas: HTMLCanvasElement | null = null;
 
       if (file.type === 'application/pdf') {
-        const arrayBuffer = await file.arrayBuffer();
-        const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-        
-        const page = await pdf.getPage(1);
-        const viewport = page.getViewport({ scale: 4.0 }); 
-        
-        const canvas = document.createElement('canvas');
-        const context = canvas.getContext('2d', { alpha: false });
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
-
-        if (context) {
-          context.fillStyle = 'white';
-          context.fillRect(0, 0, canvas.width, canvas.height);
-          await page.render({ canvasContext: context, viewport }).promise;
-          extractedId = await decodeQrFromCanvas(canvas);
-        }
+        setPdfMsg('Rendering PDF pages…');
+        // Try scale 3 first, then 5 for better resolution
+        canvas = await renderPdfToCanvas(file, 3.0);
+        if (!canvas) throw new Error('Could not render PDF. Make sure it is a valid PDF file.');
       } else if (file.type.startsWith('image/')) {
-        const img = new Image();
-        const dataUrl = await new Promise<string>((resolve) => {
-          reader.onload = (ev) => resolve(ev.target?.result as string);
-          reader.readAsDataURL(file);
+        // Render image to canvas
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(fr.result as string);
+          fr.onerror = reject;
+          fr.readAsDataURL(file);
         });
-        
-        img.src = dataUrl;
-        await new Promise((resolve) => img.onload = resolve);
-        
-        const canvas = document.createElement('canvas');
+        const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const i = new Image();
+          i.onload = () => resolve(i);
+          i.onerror = reject;
+          i.src = dataUrl;
+        });
+        canvas = document.createElement('canvas');
         canvas.width = img.width;
         canvas.height = img.height;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(img, 0, 0);
-          extractedId = await decodeQrFromCanvas(canvas);
-        }
+        const ctx = canvas.getContext('2d')!;
+        ctx.drawImage(img, 0, 0);
+      } else {
+        throw new Error('Please upload a PDF or image file (PNG, JPG, etc.).');
       }
 
-      if (!extractedId) {
-        setStatus('invalid');
-        setCertId('Unknown');
-        toast({ 
+      if (!canvas) throw new Error('Could not read the file.');
+
+      // Scan QR from canvas using jsqr
+      setPdfMsg('Scanning for QR code…');
+      let scannedId = await scanQrFromCanvas(canvas);
+
+      // Try with higher scale if first attempt failed (PDF only)
+      if (!scannedId && file.type === 'application/pdf') {
+        setPdfMsg('Retrying with higher resolution…');
+        const canvas2 = await renderPdfToCanvas(file, 6.0);
+        if (canvas2) scannedId = await scanQrFromCanvas(canvas2);
+      }
+
+      if (!scannedId) {
+        setStatus('idle');
+        setMode('manual');
+        setPdfMsg('');
+        toast({
+          title: '⚠️ QR Not Detected',
+          description: 'Could not find a QR code in the file. Please enter the Certificate ID manually.',
           variant: 'destructive',
-          title: 'No QR Code Found', 
-          description: 'The digital scanner could not find a QR code in this document.' 
         });
         return;
       }
 
-      handleQrScan(extractedId);
-      
-    } catch (err: any) {
-      console.error('Upload verification error:', err);
-      setStatus('error');
-      setErrorMsg(err.message || 'Error processing file.');
-    }
-  };
+      setPdfMsg('');
+      toast({ title: '✅ QR Detected!', description: `Certificate ID found` });
+      await verify(scannedId);
 
-  const handleManualSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!manualId.trim()) return;
-    handleQrScan(manualId.trim());
+    } catch (err: unknown) {
+      setStatus('error');
+      const msg = err instanceof Error ? err.message : 'File processing failed';
+      setErrorMsg(msg);
+      setPdfMsg('');
+    }
   };
 
   const reset = () => {
@@ -298,187 +446,172 @@ export default function VerificationForm() {
     setCertId('');
     setManualId('');
     setErrorMsg('');
+    setPdfMsg('');
   };
 
-  const handleQrScan = async (scannedId: string) => {
-    setCertId(scannedId);
-    setStatus('loading');
-    
-    try {
-      const docRef = doc(db, 'certificates', scannedId);
-      const docSnap = await getDoc(docRef);
-
-      if (!docSnap.exists()) {
-        setStatus('invalid');
-        return;
-      }
-
-      const storedData = docSnap.data();
-      const contract = getReadContract();
-      
-      if (!contract) {
-        setStatus('valid');
-        setResult({
-          studentName: storedData.studentName,
-          courseName: storedData.courseName,
-          issueDate: storedData.issueDate,
-          issuingUniversity: storedData.universityWallet || '',
-          universityName: storedData.universityName || '',
-          universityDomain: '',
-          isRevoked: false,
-          certificateId: scannedId,
-          transactionHash: storedData.transactionHash || '',
-        });
-        return;
-      }
-
-      try {
-        const hashHex = storedData.certificateHash.startsWith('0x') ? storedData.certificateHash : `0x${storedData.certificateHash}`;
-        const onChain = await contract.verifyCertificate(hashHex);
-        
-        const onChainValid = onChain[7] as boolean;
-
-        if (!onChainValid) {
-          setStatus('invalid');
-        } else {
-          setStatus('valid');
-          setResult({
-            studentName: onChain[0] || storedData.studentName,
-            courseName: onChain[1] || storedData.courseName,
-            issueDate: storedData.issueDate,
-            issuingUniversity: onChain[3],
-            universityName: onChain[4] || storedData.universityName || '',
-            universityDomain: onChain[5] || '',
-            isRevoked: onChain[6] || false,
-            certificateId: scannedId,
-            transactionHash: storedData.transactionHash || '',
-          });
-        }
-      } catch (chainErr) {
-        setStatus('valid');
-        setResult({
-          studentName: storedData.studentName,
-          courseName: storedData.courseName,
-          issueDate: storedData.issueDate,
-          issuingUniversity: storedData.universityWallet || '',
-          universityName: storedData.universityName || '',
-          universityDomain: '',
-          isRevoked: false,
-          certificateId: scannedId,
-          transactionHash: storedData.transactionHash || '',
-        });
-      }
-    } catch (err: any) {
-      setStatus('error');
-      setErrorMsg('Failed to fetch certificate details.');
-    }
-  };
-
+  // ── Render ────────────────────────────────────────────────────────────
   return (
-    <div className="space-y-8 max-w-xl mx-auto">
-      {status === 'idle' && mode === 'choose' && (
-        <div className="grid grid-cols-1 gap-8">
-          {/* Method 1: File Upload */}
-          <div className="space-y-4">
-            <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
-              <Upload className="h-3 w-3" /> Method 1: Document Upload
-            </Label>
-            <label className="group relative flex flex-col items-center gap-4 rounded-2xl border-2 border-dashed border-primary/30 
-                           bg-card p-10 text-center transition-all hover:border-primary hover:bg-primary/5 cursor-pointer">
-              <Upload className="h-12 w-12 text-primary transition-transform group-hover:scale-110" />
-              <div>
-                <p className="text-lg font-bold text-foreground">Upload PDF or Image</p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  We will automatically scan for the QR code
-                </p>
-              </div>
-              <input type="file" accept="application/pdf,image/*" className="sr-only" onChange={handleFileUpload} />
-            </label>
-          </div>
+    <div className="space-y-6">
 
-          <div className="relative flex items-center py-2">
-            <div className="flex-grow border-t border-muted/20"></div>
-            <span className="flex-shrink mx-4 text-muted-foreground text-[10px] uppercase tracking-[0.2em] font-bold">OR</span>
-            <div className="flex-grow border-t border-muted/20"></div>
-          </div>
+      {/* ---- Mode chooser ---- */}
+      {mode === 'choose' && status === 'idle' && (
+        <div className="grid gap-4 sm:grid-cols-3">
+          {/* Upload PDF */}
+          <label
+            htmlFor="cert-file-upload"
+            className="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-primary/30
+                       bg-card p-6 text-center cursor-pointer transition-all hover:border-primary hover:bg-primary/5"
+          >
+            <FileText className="h-10 w-10 text-primary transition-transform group-hover:scale-110" />
+            <div>
+              <p className="font-semibold text-sm">Upload Certificate</p>
+              <p className="text-xs text-muted-foreground mt-1">PDF or image — auto-scans QR</p>
+            </div>
+            <input
+              id="cert-file-upload"
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf,image/*"
+              className="sr-only"
+              onChange={(e) => { handleFileUpload(e); }}
+            />
+          </label>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-            {/* Method 2: Manual ID */}
-            <div className="space-y-4">
-              <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
-                <Keyboard className="h-3 w-3" /> Method 2: Manual Entry
-              </Label>
-              <form onSubmit={handleManualSubmit} className="space-y-2">
-                <Input 
-                  placeholder="Enter Certificate ID..." 
-                  value={manualId} 
+          {/* Camera scan */}
+          <button
+            id="verify-mode-camera-btn"
+            onClick={() => setMode('scan')}
+            className="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-primary/30
+                       bg-card p-6 text-center transition-all hover:border-primary hover:bg-primary/5"
+          >
+            <Camera className="h-10 w-10 text-primary transition-transform group-hover:scale-110" />
+            <div>
+              <p className="font-semibold text-sm">Scan QR Code</p>
+              <p className="text-xs text-muted-foreground mt-1">Use your camera</p>
+            </div>
+          </button>
+
+          {/* Manual entry */}
+          <button
+            id="verify-mode-manual-btn"
+            onClick={() => setMode('manual')}
+            className="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-primary/30
+                       bg-card p-6 text-center transition-all hover:border-primary hover:bg-primary/5"
+          >
+            <ShieldCheck className="h-10 w-10 text-primary transition-transform group-hover:scale-110" />
+            <div>
+              <p className="font-semibold text-sm">Enter ID Manually</p>
+              <p className="text-xs text-muted-foreground mt-1">Paste Certificate ID</p>
+            </div>
+          </button>
+        </div>
+      )}
+
+      {/* ---- PDF scanning progress ---- */}
+      {status === 'scanning_pdf' && (
+        <Card className="border-primary/20">
+          <CardContent className="flex flex-col items-center gap-4 py-10">
+            <Loader2 className="h-10 w-10 animate-spin text-primary" />
+            <div className="text-center">
+              <p className="font-semibold">Scanning Certificate…</p>
+              <p className="text-sm text-muted-foreground mt-1">{pdfMsg}</p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ---- Camera mode ---- */}
+      {mode === 'scan' && status === 'idle' && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Camera className="h-5 w-5" /> Scan QR Code
+            </CardTitle>
+            <CardDescription>Point your camera at the QR code on the certificate</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <CameraScanner onScan={(id) => { setMode('manual'); setManualId(id); verify(id); }} />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ---- Manual entry mode ---- */}
+      {(mode === 'manual') && (status === 'idle' || status === 'error') && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ShieldCheck className="h-5 w-5" /> Verify Certificate
+            </CardTitle>
+            <CardDescription>Enter the Certificate ID printed on the certificate</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={(e) => { e.preventDefault(); verify(manualId); }} className="space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="cert-id-input">Certificate ID</Label>
+                <Input
+                  id="cert-id-input"
+                  value={manualId}
                   onChange={(e) => setManualId(e.target.value)}
-                  className="bg-card font-mono text-xs h-12"
+                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                  className="font-mono"
+                  autoFocus
                 />
-                <Button type="submit" className="w-full gap-2 h-10" disabled={!manualId.trim()}>
-                  <Search className="h-4 w-4" /> Verify ID
+              </div>
+
+              {/* Also allow uploading from manual mode */}
+              <div className="border-t pt-3">
+                <Label htmlFor="cert-file-upload-manual" className="text-xs text-muted-foreground cursor-pointer flex items-center gap-2 hover:text-foreground transition-colors">
+                  <Upload className="h-4 w-4" />
+                  Or upload the certificate PDF / image to auto-detect ID
+                </Label>
+                <input
+                  id="cert-file-upload-manual"
+                  type="file"
+                  accept="application/pdf,image/*"
+                  className="sr-only"
+                  onChange={handleFileUpload}
+                />
+              </div>
+
+              {errorMsg && (
+                <p className="text-sm text-destructive flex items-center gap-1.5">
+                  <AlertTriangle className="h-4 w-4 shrink-0" />{errorMsg}
+                </p>
+              )}
+
+              <div className="flex gap-3">
+                <Button
+                  id="verify-submit-btn"
+                  type="submit"
+                  disabled={!manualId.trim()}
+                  className="flex-1 gap-2"
+                >
+                  <ShieldCheck className="h-4 w-4" /> Verify
                 </Button>
-              </form>
-            </div>
-
-            {/* Method 3: Camera Scanner */}
-            <div className="space-y-4">
-              <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
-                <Camera className="h-3 w-3" /> Method 3: Camera
-              </Label>
-              <Button 
-                variant="outline" 
-                onClick={() => setMode('scan')} 
-                className="w-full h-[104px] flex-col gap-3 border-primary/30 hover:bg-primary/5"
-              >
-                <Camera className="h-6 w-6" />
-                <div className="flex flex-col items-center">
-                  <span className="font-bold">Open Scanner</span>
-                  <span className="text-[10px] text-muted-foreground">Scan physical QR</span>
-                </div>
-              </Button>
-            </div>
-          </div>
-        </div>
+                <Button id="verify-reset-btn" type="button" variant="outline" onClick={reset}>
+                  <RotateCcw className="h-4 w-4" />
+                </Button>
+              </div>
+            </form>
+          </CardContent>
+        </Card>
       )}
 
-      {(mode === 'scan' || (mode === 'upload' && status === 'idle')) && (
-        <div className="flex flex-col items-center gap-4">
-          <QrScanner onScan={handleQrScan} />
-          <Button variant="ghost" size="sm" onClick={reset}>Cancel</Button>
-        </div>
-      )}
-
+      {/* ---- Blockchain loading ---- */}
       {status === 'loading' && (
-        <div className="flex flex-col items-center gap-6 py-20 text-center animate-in fade-in duration-500">
-          <div className="relative">
-            <Loader2 className="h-16 w-16 animate-spin text-primary opacity-20" />
-            <ShieldCheck className="absolute inset-0 m-auto h-8 w-8 text-primary animate-pulse" />
-          </div>
-          <div>
-            <p className="text-lg font-semibold">Verifying Authenticity</p>
-            <p className="text-sm text-muted-foreground">Communicating with the blockchain...</p>
-          </div>
+        <div className="flex flex-col items-center gap-4 py-12">
+          <Loader2 className="h-10 w-10 animate-spin text-primary" />
+          <p className="text-muted-foreground text-sm">Querying the blockchain…</p>
         </div>
       )}
 
+      {/* ---- Results ---- */}
       {(status === 'valid' || status === 'invalid') && (
-        <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+        <div className="space-y-4">
           <ResultCard status={status} result={result} certId={certId} />
-          <div className="flex justify-center">
-            <Button onClick={reset} variant="ghost" className="gap-2 text-muted-foreground hover:text-foreground">
-              <RotateCcw className="h-4 w-4" /> Verify Another
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {status === 'error' && (
-        <div className="space-y-4 text-center">
-          <AlertTriangle className="h-12 w-12 text-destructive mx-auto" />
-          <h2 className="text-xl font-bold">Error</h2>
-          <p className="text-muted-foreground">{errorMsg}</p>
-          <Button onClick={reset}>Try Again</Button>
+          <Button id="verify-again-btn" variant="outline" onClick={reset} className="w-full gap-2">
+            <RotateCcw className="h-4 w-4" /> Verify Another Certificate
+          </Button>
         </div>
       )}
     </div>
