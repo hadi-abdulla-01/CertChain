@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { ethers } from 'ethers';
 import { useMetaMask } from '@/hooks/useMetaMask';
 import { generateCertificatePdf } from '@/lib/generateCertificatePdf';
@@ -11,7 +11,7 @@ import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
 import {
-  Loader2, Wallet, AlertTriangle, ShieldCheck, Sparkles, ShieldAlert, Download, ExternalLink
+  Loader2, Wallet, AlertTriangle, ShieldCheck, ShieldAlert, Sparkles
 } from 'lucide-react';
 import { RealQrCode } from '@/components/common/RealQrCode';
 import { uploadPdfToCloudinary } from '@/lib/cloudinary';
@@ -19,7 +19,7 @@ import { db } from '@/lib/firebase';
 import { doc, setDoc } from 'firebase/firestore';
 import { extractCertificateInfo } from '@/ai/flows/extract-certificate-info';
 
-type Step = 'idle' | 'extracting' | 'signing' | 'confirming' | 'generating' | 'uploading' | 'done' | 'error';
+type Step = 'idle' | 'signing' | 'confirming' | 'generating' | 'uploading' | 'done' | 'error';
 
 type IssuedCert = {
   certificateId: string;
@@ -33,7 +33,6 @@ type IssuedCert = {
 };
 
 const STEPS = [
-  { id: 'extracting', label: 'AI Extraction' },
   { id: 'signing', label: 'Sign Transaction' },
   { id: 'confirming', label: 'Blockchain Confirm' },
   { id: 'generating', label: 'Secure PDF' },
@@ -46,11 +45,10 @@ function StepIndicator({ current }: { current: Step }) {
     <div className="flex flex-wrap items-center justify-center gap-4 py-4 mb-6 bg-muted/30 rounded-lg">
       {STEPS.map((s, i) => (
         <div key={s.id} className="flex items-center gap-2">
-          <div className={`h-6 w-6 rounded-full flex items-center justify-center text-[10px] font-bold transition-all ${
-            i < idx ? 'bg-green-500 text-white' :
+          <div className={`h-6 w-6 rounded-full flex items-center justify-center text-[10px] font-bold transition-all ${i < idx ? 'bg-green-500 text-white' :
             i === idx ? 'bg-primary text-white ring-4 ring-primary/20 animate-pulse' :
-            'bg-muted-foreground/20 text-muted-foreground'
-          }`}>
+              'bg-muted-foreground/20 text-muted-foreground'
+            }`}>
             {i < idx ? '✓' : i + 1}
           </div>
           <span className={`text-xs font-medium ${i === idx ? 'text-primary' : 'text-muted-foreground'}`}>
@@ -70,13 +68,13 @@ export default function CertificateForm() {
   const [step, setStep] = useState<Step>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [issuedCert, setIssuedCert] = useState<IssuedCert | null>(null);
-  
+
   const [studentName, setStudentName] = useState('');
   const [courseName, setCourseName] = useState('');
   const [issueDate, setIssueDate] = useState('');
-  const [isExtracting, setIsExtracting] = useState(false);
   const [onChainVerified, setOnChainVerified] = useState<boolean | null>(null);
 
+  const [isExtracting, setIsExtracting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -106,7 +104,6 @@ export default function CertificateForm() {
     if (!file) return;
 
     setIsExtracting(true);
-    setStep('extracting');
     setErrorMsg('');
 
     try {
@@ -118,18 +115,16 @@ export default function CertificateForm() {
           setStudentName(extracted.studentName);
           setCourseName(extracted.courseName);
           setIssueDate(extracted.issueDate);
-          toast({ title: 'AI Extraction Successful' });
+          toast({ title: 'AI Extraction Successful', description: 'Data auto-filled from document.' });
         } catch (aiErr) {
-          toast({ title: 'Extraction Failed', description: 'Please fill details manually.', variant: 'destructive' });
+          toast({ title: 'Extraction Failed', description: 'Please enter details manually.', variant: 'destructive' });
         } finally {
           setIsExtracting(false);
-          setStep('idle');
         }
       };
       reader.readAsDataURL(file);
     } catch (err) {
       setIsExtracting(false);
-      setStep('idle');
     }
   };
 
@@ -143,12 +138,6 @@ export default function CertificateForm() {
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setErrorMsg('');
-
-    const file = fileInputRef.current?.files?.[0];
-    if (!file) {
-      setErrorMsg('Please upload the certificate document.');
-      return;
-    }
 
     if (!isConnected || !account) {
       setErrorMsg('Connect your MetaMask wallet.');
@@ -167,7 +156,7 @@ export default function CertificateForm() {
 
     try {
       const contract = await getSignerContract();
-      
+
       let uniName = '';
       try {
         const uni = await contract.getUniversity(account);
@@ -190,13 +179,13 @@ export default function CertificateForm() {
       const txHash = receipt.hash as string;
 
       setStep('generating');
-      const arrayBuffer = await file.arrayBuffer();
-      const isImage = file.type.startsWith('image/');
-      
+
       const { pdfBlob } = await generateCertificatePdf({
         certificateId: certId,
-        originalBuffer: arrayBuffer,
-        isImage,
+        studentName,
+        courseName,
+        issueDate,
+        universityName: uniName
       });
 
       const securedPdfHash = await calculateFileHash(pdfBlob);
@@ -207,8 +196,8 @@ export default function CertificateForm() {
         const safeName = studentName.replace(/\s+/g, '-').toLowerCase();
         const uploaded = await uploadPdfToCloudinary(pdfBlob, `${certId}-${safeName}`);
         pdfDownloadUrl = uploaded.secureUrl;
-      } catch (uErr) { 
-        console.warn('Cloudinary upload skipped', uErr); 
+      } catch (uErr) {
+        console.warn('Cloudinary upload skipped', uErr);
       }
 
       await setDoc(doc(db, 'certificates', certId), {
@@ -222,7 +211,7 @@ export default function CertificateForm() {
         universityName: uniName,
         universityWallet: account,
         pdfUrl: pdfDownloadUrl,
-        originalFileAttached: true,
+        originalFileAttached: false,
       });
 
       setStep('done');
@@ -240,7 +229,6 @@ export default function CertificateForm() {
       setStudentName('');
       setCourseName('');
       setIssueDate('');
-      if (fileInputRef.current) fileInputRef.current.value = '';
       toast({ title: 'Certificate Issued Successfully' });
 
     } catch (err: any) {
@@ -259,7 +247,7 @@ export default function CertificateForm() {
     URL.revokeObjectURL(url);
   };
 
-  const isProcessing = ['extracting', 'signing', 'confirming', 'generating', 'uploading'].includes(step);
+  const isProcessing = ['signing', 'confirming', 'generating', 'uploading'].includes(step);
 
   return (
     <div className="space-y-6">
@@ -268,7 +256,7 @@ export default function CertificateForm() {
           <ShieldAlert className="h-4 w-4" />
           <AlertTitle>Wallet Not Authorized</AlertTitle>
           <AlertDescription>
-            Your account is whitelisted in our database, but your wallet ({account?.slice(0, 10)}...) is not yet authorized on the blockchain. 
+            Your account is whitelisted in our database, but your wallet ({account?.slice(0, 10)}...) is not yet authorized on the blockchain.
           </AlertDescription>
         </Alert>
       )}
@@ -289,25 +277,25 @@ export default function CertificateForm() {
       <Card>
         <CardHeader>
           <CardTitle>Issue New Certificate</CardTitle>
-          <CardDescription>Upload your original certificate document to add the verification QR.</CardDescription>
+          <CardDescription>Upload an old certificate to auto-fill details using AI, or simply enter them manually. A clean, fresh PDF will be generated and signed on the blockchain.</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-6">
+
             <div className="space-y-2">
-              <Label htmlFor="doc-upload">Upload Original Document (PDF/Image)</Label>
+              <Label htmlFor="doc-upload">Upload Document for AI Auto-Fill (Optional)</Label>
               <div className="relative">
-                <Input 
-                  id="doc-upload" 
-                  type="file" 
+                <Input
+                  id="doc-upload"
+                  type="file"
                   ref={fileInputRef}
                   onChange={handleFileChange}
-                  disabled={isProcessing}
+                  disabled={isProcessing || isExtracting}
                   accept="application/pdf,image/*"
-                  required
                 />
                 {isExtracting && (
-                  <div className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-primary animate-pulse flex items-center gap-1">
-                    <Sparkles className="h-3 w-3" /> AI extracting...
+                  <div className="absolute right-4 top-1/2 -translate-y-1/2 text-xs text-primary animate-pulse flex items-center gap-1.5 font-medium bg-background/80 px-2 py-1 rounded">
+                    <Sparkles className="h-3.5 w-3.5" /> Extracting details...
                   </div>
                 )}
               </div>
@@ -316,11 +304,11 @@ export default function CertificateForm() {
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label>Student Name</Label>
-                <Input value={studentName} onChange={e => setStudentName(e.target.value)} required disabled={isProcessing} />
+                <Input value={studentName} onChange={e => setStudentName(e.target.value)} required disabled={isProcessing} placeholder="e.g. John Doe" />
               </div>
               <div className="space-y-2">
                 <Label>Course Name</Label>
-                <Input value={courseName} onChange={e => setCourseName(e.target.value)} required disabled={isProcessing} />
+                <Input value={courseName} onChange={e => setCourseName(e.target.value)} required disabled={isProcessing} placeholder="e.g. Bachelor of Science" />
               </div>
             </div>
 
@@ -340,7 +328,7 @@ export default function CertificateForm() {
             )}
 
             <Button type="submit" className="w-full" disabled={isProcessing || !isConnected || onChainVerified === false}>
-              {isProcessing ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> {STEPS.find(s => s.id === step)?.label}</> : <><ShieldCheck className="mr-2 h-4 w-4" /> Secure & Sign</>}
+              {isProcessing ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> {STEPS.find(s => s.id === step)?.label}</> : <><ShieldCheck className="mr-2 h-4 w-4" /> Generate & Sign Certificate</>}
             </Button>
           </form>
         </CardContent>

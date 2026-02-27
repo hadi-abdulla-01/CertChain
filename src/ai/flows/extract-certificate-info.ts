@@ -29,7 +29,6 @@ export type ExtractOutput = z.infer<typeof ExtractOutputSchema>;
 export async function extractCertificateInfo(input: ExtractInput): Promise<ExtractOutput> {
   const { output } = await ai.generate({
     model: 'googleai/gemini-2.5-flash',
-    input: { schema: ExtractInputSchema },
     output: { schema: ExtractOutputSchema },
     prompt: [
       { text: "You are an expert document analyzer. Extract the student's name, the course name, and the issue date from the provided certificate document." },
